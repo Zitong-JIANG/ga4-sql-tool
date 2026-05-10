@@ -1,0 +1,29 @@
+# Claude Code local settings
+.claude/
+
+# Schema files — contain internal table field definitions
+ga4_*.json
+
+# SQL examples — contain internal query patterns
+sql_example/
+
+# Internal version of the script (full preset list)
+internal/
+
+# Root-level script (use public/ for the GitHub version)
+/ga4_query_builder.py
+
+# Generated SQL output from the tool
+/ab_app_*.sql
+/ga4_*.sql
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Environment / secrets
+.env
