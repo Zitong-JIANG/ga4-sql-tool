@@ -2,12 +2,13 @@
 
 A command-line tool that generates ready-to-run BigQuery SQL for GA4 event data — no manual template editing required.
 
-Supports two modes:
+Supports three modes:
 
 | Mode | What it generates |
 |---|---|
 | Basic event query | A `SELECT` query filtered by event name, date range, and country — for web, app, or ecom tables |
-| App Firebase A/B test | A full CTE-based analysis query with experiment population, per-metric CTEs, and `avg_per_exposed_user` / `avg_per_active_user` output |
+| App Firebase A/B test | A full CTE-based analysis query with experiment population, per-metric CTEs, and `avg_per_exposed_user` / `avg_per_user_with_event` output |
+| Significance test | Welch's t-test on `avg_per_exposed_user` with 99th-percentile winsorization — outputs `t_stat`, `p_value`, `relative_lift`, and `is_significant_95` per metric × variant |
 
 ## Prerequisites
 
@@ -85,13 +86,36 @@ The generated SQL follows a standard 4-stage structure:
 1. `prep_platform` + `prep_all` → `prep` — loads and filters experiment-exposed events, plus an ALL-platform rollup
 2. `experiment_population` — distinct exposed users per platform × variant
 3. One CTE per metric — `events` + `users_with_event` aggregated by platform × variant
-4. Final `SELECT` — joins metrics with population, computes `avg_per_exposed_user` and `avg_per_active_user` via `SAFE_DIVIDE`
+4. Final `SELECT` — joins metrics with population, computes `avg_per_exposed_user` and `avg_per_user_with_event` via `SAFE_DIVIDE`
 
 Output is split by `ANDROID`, `IOS`, and `ALL` rows automatically.
 
+### Mode 3 — Significance test
+
+Uses the same inputs as Mode 2, plus a control variant name. Runs a **Welch's t-test** on `avg_per_exposed_user` for each metric:
+
+- Per-user event counts are **winsorized at the 99th percentile** per variant to limit outlier influence
+- Users with zero events are included in the mean and variance via the experiment population denominator
+- p-value approximated via the Abramowitz & Stegun normal CDF polynomial (max error 1.5 × 10⁻⁷) — no `ERF()` dependency
+- `active_user_base` is excluded from Mode 3 (not a behavioural frequency metric)
+
+Output columns: `control_mean`, `treatment_mean`, `relative_lift`, `t_stat`, `p_value`, `is_significant_95`
+
+```
+Select mode [1/2/3]: 3
+Start date: 2024-01-01
+End date:   2024-01-31
+Android firebase_exp key: firebase_exp_android
+iOS     firebase_exp key: firebase_exp_ios
+  Add metric > 1          # purchase
+  Add metric > 4          # view_item
+  Add metric > d
+Control variant name: 0
+```
+
 ### Saving output
 
-After the SQL is printed, the tool asks whether to save it to a `.sql` file. The filename encodes the key parameters (platform, event, date range).
+After the SQL is printed, the tool asks whether to save it to a `.sql` file. The filename encodes the key parameters (experiment key, date range, metrics).
 
 ## Project structure
 

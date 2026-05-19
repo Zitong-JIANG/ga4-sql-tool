@@ -37,7 +37,7 @@ PRESET_METRICS: list[dict[str, Any]] = [
     {"name": "session_start",    "event": "session_start",   "extra": "", "desc": "COUNT(events) / exposed user  [1 per session → avg sessions/user]"},
     {"name": "screen_view",      "event": "screen_view",     "extra": "", "desc": "COUNT(events) / exposed user, filtered by screen_name", "needs_screen": True},
     {"name": "engaged_sessions", "event": None, "special": "engaged_sessions", "desc": "COUNT(DISTINCT session_id) / exposed user"},
-    {"name": "active_user_base", "event": None, "special": "active_user_base", "desc": "COUNT(DISTINCT user) with ≥1 engaged session  [denominator only, no avg output]"},
+    {"name": "active_user_base", "event": None, "special": "active_user_base", "desc": "COUNT(DISTINCT user) with ≥1 engaged session  [denominator only, no avg output]", "exclude_mode3": True},
 ]
 
 
@@ -271,11 +271,51 @@ def _metric_cte(m: dict[str, Any]) -> str:
 )"""
 
 
-def collect_metrics() -> list[dict[str, Any]]:
+def _ttest_metric_ctes(m: dict[str, Any]) -> str:
+    """Build two CTEs per metric for t-test: raw per-user counts + winsorized at p99."""
+    cte_id = f"metric_{safe_name(m['name'])}"
+    raw_id = f"{cte_id}_raw"
+    special = m.get("special", "")
+    extra = m.get("extra", "")
+    extra_clause = f"\n    AND {extra}" if extra else ""
+
+    if special == "engaged_sessions":
+        count_expr = "COUNT(DISTINCT user_session_id)"
+        where_clause = "WHERE engaged_session_event = 1"
+    else:
+        count_expr = "COUNT(1)"
+        where_clause = f"WHERE event_name = '{m['event']}'{extra_clause}"
+
+    return f"""\
+{raw_id} AS (
+  SELECT
+    platform, raw_experiment_id, variant, user_pseudo_id,
+    {count_expr} AS raw_count
+  FROM prep
+  {where_clause}
+  GROUP BY platform, raw_experiment_id, variant, user_pseudo_id
+),
+
+{cte_id} AS (
+  SELECT
+    platform, raw_experiment_id, variant,
+    '{m["name"]}' AS metric_name,
+    LEAST(
+      CAST(raw_count AS FLOAT64),
+      PERCENTILE_CONT(raw_count, 0.99) OVER (
+        PARTITION BY platform, raw_experiment_id, variant
+      )
+    ) AS winsorized_count
+  FROM {raw_id}
+)"""
+
+
+def collect_metrics(mode3: bool = False) -> list[dict[str, Any]]:
     """Interactive metric selection: presets + custom."""
     print()
     print("  Add metrics (presets or custom):")
-    for i, p in enumerate(PRESET_METRICS, 1):
+    available = [p for p in PRESET_METRICS if not (mode3 and p.get("exclude_mode3"))]
+    for i, p in enumerate(available, 1):
         desc = p.get("desc", "")
         tag = f"  — {desc}" if desc else ""
         print(f"    [{i:>2}] {p['name']}{tag}")
@@ -309,8 +349,8 @@ def collect_metrics() -> list[dict[str, Any]]:
 
         if raw.isdigit():
             idx = int(raw) - 1
-            if 0 <= idx < len(PRESET_METRICS):
-                preset = dict(PRESET_METRICS[idx])
+            if 0 <= idx < len(available):
+                preset = dict(available[idx])
                 if preset["name"] in added_names:
                     print(f"  [!] '{preset['name']}' already added.")
                     continue
@@ -444,13 +484,198 @@ SELECT
     WHEN m.users_with_event = 0 THEN NULL
     ELSE ROUND(SAFE_DIVIDE(CAST(m.events AS FLOAT64),
                            CAST(m.users_with_event AS FLOAT64)), 4)
-  END AS avg_per_active_user
+  END AS avg_per_user_with_event
 FROM metrics_union m
 JOIN experiment_population ep
   ON  ep.platform                          = m.platform
  AND  IFNULL(ep.raw_experiment_id, '')     = IFNULL(m.raw_experiment_id, '')
  AND  ep.variant                           = m.variant
 ORDER BY platform, variant, metric_name;
+"""
+
+
+def build_significance_sql(start_date: str, end_date: str,
+                            android_key: str, ios_key: str,
+                            metrics: list[dict[str, Any]],
+                            control_variant: str) -> str:
+    """Welch's t-test on avg_per_exposed_user with 99th-percentile winsorization."""
+    table = TABLES["app"]
+    now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    cte_blocks = [_ttest_metric_ctes(m) for m in metrics]
+    metric_ctes_sql = ",\n\n".join(cte_blocks) + ","
+
+    union_lines = "\n  UNION ALL SELECT * FROM ".join(
+        f"metric_{safe_name(m['name'])}" for m in metrics
+    )
+
+    return f"""\
+-- ============================================================
+-- App Firebase A/B Test — Significance Test (Welch's t-test)
+-- avg_per_exposed_user, winsorized at p99
+-- Date range  : {start_date} to {end_date}
+-- Android key : {android_key}
+-- iOS key     : {ios_key}
+-- Control     : {control_variant}
+-- Metrics     : {", ".join(m["name"] for m in metrics)}
+-- Generated   : {now}
+-- ============================================================
+
+DECLARE start_date DATE DEFAULT DATE('{start_date}');
+DECLARE end_date   DATE DEFAULT DATE('{end_date}');
+
+WITH prep_platform AS (
+  SELECT
+    event_date,
+    platform,
+    user_pseudo_id,
+    user_session_id,
+    event_name,
+    firebase_screen,
+    engaged_session_event,
+    time.event_timestamp_utc       AS event_ts,
+    ufe.key                        AS raw_experiment_id,
+    ufe.string_value               AS variant
+  FROM {table}
+  CROSS JOIN UNNEST(user_firebase_experiments) AS ufe
+  WHERE event_date BETWEEN start_date AND end_date
+    AND platform IN ('ANDROID', 'IOS')
+    AND user_pseudo_id IS NOT NULL
+    AND user_session_id IS NOT NULL
+    AND ufe.key IN ('{android_key}', '{ios_key}')
+    AND (
+          (platform = 'ANDROID' AND ufe.key = '{android_key}')
+       OR (platform = 'IOS'     AND ufe.key = '{ios_key}')
+    )
+),
+
+prep_all AS (
+  SELECT
+    event_date,
+    'ALL'                          AS platform,
+    user_pseudo_id,
+    user_session_id,
+    event_name,
+    firebase_screen,
+    engaged_session_event,
+    time.event_timestamp_utc       AS event_ts,
+    CAST(NULL AS STRING)           AS raw_experiment_id,
+    ufe.string_value               AS variant
+  FROM {table}
+  CROSS JOIN UNNEST(user_firebase_experiments) AS ufe
+  WHERE event_date BETWEEN start_date AND end_date
+    AND platform IN ('ANDROID', 'IOS')
+    AND user_pseudo_id IS NOT NULL
+    AND user_session_id IS NOT NULL
+    AND ufe.key IN ('{android_key}', '{ios_key}')
+    AND (
+          (platform = 'ANDROID' AND ufe.key = '{android_key}')
+       OR (platform = 'IOS'     AND ufe.key = '{ios_key}')
+    )
+),
+
+prep AS (
+  SELECT * FROM prep_platform
+  UNION ALL
+  SELECT * FROM prep_all
+),
+
+experiment_population AS (
+  SELECT
+    platform,
+    raw_experiment_id,
+    variant,
+    COUNT(DISTINCT user_pseudo_id) AS n
+  FROM prep
+  GROUP BY platform, raw_experiment_id, variant
+),
+
+{metric_ctes_sql}
+
+metrics_agg AS (
+  SELECT
+    platform, raw_experiment_id, variant, metric_name,
+    SUM(winsorized_count)                        AS sum_x,
+    SUM(winsorized_count * winsorized_count)     AS sum_x2
+  FROM (
+    SELECT * FROM {union_lines}
+  )
+  GROUP BY platform, raw_experiment_id, variant, metric_name
+),
+
+stats AS (
+  SELECT
+    ep.platform,
+    ep.raw_experiment_id,
+    ep.variant,
+    ma.metric_name,
+    ep.n,
+    SAFE_DIVIDE(ma.sum_x,  ep.n)                                              AS mean,
+    SAFE_DIVIDE(ma.sum_x2, ep.n)
+      - POW(SAFE_DIVIDE(ma.sum_x, ep.n), 2)                                  AS var
+  FROM experiment_population ep
+  JOIN metrics_agg ma
+    ON  ma.platform                      = ep.platform
+   AND  IFNULL(ma.raw_experiment_id, '') = IFNULL(ep.raw_experiment_id, '')
+   AND  ma.variant                       = ep.variant
+),
+
+sig_base AS (
+  SELECT
+    s_t.platform,
+    s_t.raw_experiment_id,
+    s_t.metric_name,
+    '{control_variant}'                                      AS control_variant,
+    s_t.variant                                              AS treatment_variant,
+    s_c.n                                                    AS control_n,
+    s_t.n                                                    AS treatment_n,
+    ROUND(s_c.mean, 4)                                       AS control_mean,
+    ROUND(s_t.mean, 4)                                       AS treatment_mean,
+    SAFE_DIVIDE(
+      s_t.mean - s_c.mean,
+      SQRT(SAFE_DIVIDE(s_c.var, s_c.n) + SAFE_DIVIDE(s_t.var, s_t.n))
+    )                                                        AS t_stat
+  FROM stats s_t
+  JOIN stats s_c
+    ON  s_c.platform                      = s_t.platform
+   AND  IFNULL(s_c.raw_experiment_id, '') = IFNULL(s_t.raw_experiment_id, '')
+   AND  s_c.metric_name                   = s_t.metric_name
+   AND  s_c.variant                       = '{control_variant}'
+  WHERE s_t.variant != '{control_variant}'
+),
+
+sig_pvalue AS (
+  SELECT
+    *,
+    ABS(t_stat) / SQRT(2)                               AS _x,
+    1.0 / (1.0 + 0.3275911 * ABS(t_stat) / SQRT(2))    AS _tp
+  FROM sig_base
+)
+
+SELECT
+  platform,
+  raw_experiment_id,
+  metric_name,
+  control_variant,
+  treatment_variant,
+  control_n,
+  treatment_n,
+  control_mean,
+  treatment_mean,
+  ROUND(SAFE_DIVIDE(treatment_mean - control_mean,
+                    control_mean), 4)                        AS relative_lift,
+  ROUND(t_stat, 4)                                           AS t_stat,
+  ROUND(
+    (  0.254829592  * _tp
+     - 0.284496736  * POW(_tp, 2)
+     + 1.421413741  * POW(_tp, 3)
+     - 1.453152027  * POW(_tp, 4)
+     + 1.061405429  * POW(_tp, 5))
+    * EXP(-_x * _x)
+  , 4)                                                       AS p_value,
+  ABS(t_stat) >= 1.96                                        AS is_significant_95
+FROM sig_pvalue
+ORDER BY platform, metric_name, treatment_variant;
 """
 
 
@@ -473,6 +698,28 @@ def run_ab_test_app() -> None:
     save_sql(sql, f"ab_app_{android_key}_{start}_{end}_{metric_tag}.sql")
 
 
+def run_significance_test() -> None:
+    print()
+    start, end = ask_dates()
+
+    print()
+    android_key = get_input("Android firebase_exp key (e.g. firebase_exp_android): ")
+    ios_key     = get_input("iOS     firebase_exp key (e.g. firebase_exp_ios): ")
+
+    metrics = collect_metrics(mode3=True)
+
+    print()
+    control_variant = get_input("Control variant name (e.g. 0, control, baseline): ")
+
+    sql = build_significance_sql(start, end, android_key, ios_key, metrics, control_variant)
+
+    print("\n" + "="*60 + "\n  Generated SQL\n" + "="*60 + "\n")
+    print(sql)
+
+    metric_tag = "_".join(safe_name(m["name"]) for m in metrics[:3])
+    save_sql(sql, f"sig_{android_key}_{start}_{end}_{metric_tag}.sql")
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -482,17 +729,21 @@ def main() -> None:
     print()
     print("  [1] Basic event query   (web / app / ecom)")
     print("  [2] App Firebase A/B test")
+    print("  [3] App Firebase A/B test — significance test")
     print()
 
     while True:
-        mode = input("Select mode [1/2]: ").strip()
+        mode = input("Select mode [1/2/3]: ").strip()
         if mode == "1":
             run_event_query()
             break
         if mode == "2":
             run_ab_test_app()
             break
-        print("  [!] Enter 1 or 2.")
+        if mode == "3":
+            run_significance_test()
+            break
+        print("  [!] Enter 1, 2, or 3.")
 
 
 if __name__ == "__main__":
