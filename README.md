@@ -2,13 +2,14 @@
 
 A command-line tool that generates ready-to-run BigQuery SQL for GA4 event data — no manual template editing required.
 
-Supports three modes:
+Supports four modes:
 
 | Mode | What it generates |
 |---|---|
 | Basic event query | A `SELECT` query filtered by event name, date range, and country — for web, app, or ecom tables |
 | App Firebase A/B test | A full CTE-based analysis query with experiment population, per-metric CTEs, and `avg_per_exposed_user` / `avg_per_user_with_event` output |
 | Significance test | Welch's t-test on `avg_per_exposed_user` with 99th-percentile winsorization — outputs `t_stat`, `p_value`, `relative_lift`, and `is_significant_95` per metric × variant |
+| User-level raw data export | One row per exposed user with per-metric event counts — for feeding into your own significance test or notebook |
 
 ## Prerequisites
 
@@ -41,7 +42,7 @@ python3 public/ga4_query_builder.py
 Prompts for platform, event name, date range, and optional country filter. Outputs a `SELECT` with session identifiers, traffic source, geo, device, and platform-specific fields (page info for web, screen info for app, item-level fields for ecom).
 
 ```
-Select mode [1/2]: 1
+Select mode [1/2/3/4]: 1
 Platform [1/2/3]: 2          # app
 Event name: screen_view
 Start date: 2024-01-01
@@ -54,7 +55,7 @@ Country:                     # leave blank for all
 Prompts for date range, Android and iOS Firebase experiment keys, then lets you pick metrics from a preset list or enter custom event names.
 
 ```
-Select mode [1/2]: 2
+Select mode [1/2/3/4]: 2
 Start date: 2024-01-01
 End date:   2024-01-31
 Android firebase_exp key: firebase_exp_android
@@ -69,14 +70,15 @@ iOS     firebase_exp key: firebase_exp_ios
   [ 6] search           — COUNT(events) / exposed user
   [ 7] session_start    — COUNT(events) / exposed user  [1 per session → avg sessions/user]
   [ 8] screen_view      — COUNT(events) / exposed user, filtered by screen_name
-  [ 9] engaged_sessions — COUNT(DISTINCT session_id) / exposed user
-  [10] active_user_base — COUNT(DISTINCT user) with ≥1 engaged session  [denominator only, no avg output]
+  [ 9] pdp_views        — COUNT(events) / exposed user, screen_view on Productdetail
+  [10] engaged_sessions — COUNT(DISTINCT session_id) / exposed user
+  [11] active_user_base — COUNT(DISTINCT user) with ≥1 engaged session  [denominator only, no avg output]
   [ c] custom event name
   [ d] done — finish adding metrics
 
   Add metric > 1
   + added: purchase
-  Add metric > 9
+  Add metric > 10
   + added: engaged_sessions
   Add metric > d
 ```
@@ -102,7 +104,7 @@ Uses the same inputs as Mode 2, plus a control variant name. Runs a **Welch's t-
 Output columns: `control_mean`, `treatment_mean`, `relative_lift`, `t_stat`, `p_value`, `is_significant_95`
 
 ```
-Select mode [1/2/3]: 3
+Select mode [1/2/3/4]: 3
 Start date: 2024-01-01
 End date:   2024-01-31
 Android firebase_exp key: firebase_exp_android
@@ -111,6 +113,25 @@ iOS     firebase_exp key: firebase_exp_ios
   Add metric > 4          # view_item
   Add metric > d
 Control variant name: 0
+```
+
+### Mode 4 — User-level raw data export
+
+Exports one row per exposed user with raw (unwinsorized) per-metric event counts. Use this when you want to run your own significance test — in Python, R, or a notebook — rather than relying on the built-in Welch's t-test.
+
+- Output schema: `user_pseudo_id`, `variant`, `metric_<name>` (one column per selected metric)
+- Users with zero events for a metric get `0` (via `COALESCE`)
+- `active_user_base` is excluded (it's a denominator, not a per-user count)
+
+```
+Select mode [1/2/3/4]: 4
+Start date: 2024-01-01
+End date:   2024-01-31
+Android firebase_exp key: firebase_exp_android
+iOS     firebase_exp key: firebase_exp_ios
+  Add metric > 1          # purchase
+  Add metric > 4          # view_item
+  Add metric > d
 ```
 
 ### Saving output

@@ -16,6 +16,8 @@ internal/
 # Generated SQL output from the tool
 /ab_app_*.sql
 /ga4_*.sql
+/sig_*.sql
+/raw_*.sql
 
 # Python
 __pycache__/

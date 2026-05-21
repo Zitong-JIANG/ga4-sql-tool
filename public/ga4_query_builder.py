@@ -36,8 +36,9 @@ PRESET_METRICS: list[dict[str, Any]] = [
     {"name": "search",           "event": "search",          "extra": "", "desc": "COUNT(events) / exposed user"},
     {"name": "session_start",    "event": "session_start",   "extra": "", "desc": "COUNT(events) / exposed user  [1 per session → avg sessions/user]"},
     {"name": "screen_view",      "event": "screen_view",     "extra": "", "desc": "COUNT(events) / exposed user, filtered by screen_name", "needs_screen": True},
+    {"name": "pdp_views",        "event": "screen_view",     "extra": "firebase_screen = 'Productdetail'", "desc": "COUNT(events) / exposed user, screen_view on Productdetail"},
     {"name": "engaged_sessions", "event": None, "special": "engaged_sessions", "desc": "COUNT(DISTINCT session_id) / exposed user"},
-    {"name": "active_user_base", "event": None, "special": "active_user_base", "desc": "COUNT(DISTINCT user) with ≥1 engaged session  [denominator only, no avg output]", "exclude_mode3": True},
+    {"name": "active_user_base", "event": None, "special": "active_user_base", "desc": "COUNT(DISTINCT user) with ≥1 engaged session  [denominator only, no avg output]", "exclude_mode3": True, "exclude_mode4": True},
 ]
 
 
@@ -310,11 +311,15 @@ def _ttest_metric_ctes(m: dict[str, Any]) -> str:
 )"""
 
 
-def collect_metrics(mode3: bool = False) -> list[dict[str, Any]]:
+def collect_metrics(mode3: bool = False, mode4: bool = False) -> list[dict[str, Any]]:
     """Interactive metric selection: presets + custom."""
     print()
     print("  Add metrics (presets or custom):")
-    available = [p for p in PRESET_METRICS if not (mode3 and p.get("exclude_mode3"))]
+    available = [
+        p for p in PRESET_METRICS
+        if not (mode3 and p.get("exclude_mode3"))
+        and not (mode4 and p.get("exclude_mode4"))
+    ]
     for i, p in enumerate(available, 1):
         desc = p.get("desc", "")
         tag = f"  — {desc}" if desc else ""
@@ -679,6 +684,125 @@ ORDER BY platform, metric_name, treatment_variant;
 """
 
 
+def _raw_user_metric_cte(m: dict[str, Any]) -> str:
+    """Per-user event count CTE for Mode 4 raw data export."""
+    cte_id  = f"metric_{safe_name(m['name'])}"
+    special = m.get("special", "")
+
+    if special == "engaged_sessions":
+        count_expr   = "COUNT(DISTINCT user_session_id)"
+        where_clause = "WHERE engaged_session_event = 1"
+    else:
+        extra = m.get("extra", "")
+        extra_clause  = f"\n    AND {extra}" if extra else ""
+        count_expr    = "COUNT(1)"
+        where_clause  = f"WHERE event_name = '{m['event']}'{extra_clause}"
+
+    return f"""\
+{cte_id} AS (
+  SELECT
+    user_pseudo_id, variant,
+    {count_expr} AS cnt
+  FROM prep
+  {where_clause}
+  GROUP BY user_pseudo_id, variant
+)"""
+
+
+def build_raw_data_sql(start_date: str, end_date: str,
+                        android_key: str, ios_key: str,
+                        metrics: list[dict[str, Any]]) -> str:
+    """One row per user_pseudo_id with per-metric event counts — for custom significance tests."""
+    table = TABLES["app"]
+    now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    cte_blocks      = [_raw_user_metric_cte(m) for m in metrics]
+    metric_ctes_sql = ",\n\n".join(cte_blocks)
+
+    join_lines = "\n".join(
+        f"LEFT JOIN metric_{safe_name(m['name'])} AS m_{safe_name(m['name'])}"
+        f"\n  USING (user_pseudo_id, variant)"
+        for m in metrics
+    )
+
+    select_metric_cols = ",\n".join(
+        f"  COALESCE(m_{safe_name(m['name'])}.cnt, 0)  AS metric_{safe_name(m['name'])}"
+        for m in metrics
+    )
+
+    return f"""\
+-- ============================================================
+-- App Firebase A/B Test — User-Level Raw Data  (Mode 4)
+-- One row per user_pseudo_id; use for your own significance test
+-- Date range  : {start_date} to {end_date}
+-- Android key : {android_key}
+-- iOS key     : {ios_key}
+-- Metrics     : {", ".join(m["name"] for m in metrics)}
+-- Generated   : {now}
+-- ============================================================
+
+DECLARE start_date DATE DEFAULT DATE('{start_date}');
+DECLARE end_date   DATE DEFAULT DATE('{end_date}');
+
+WITH prep AS (
+  SELECT
+    user_pseudo_id,
+    user_session_id,
+    event_name,
+    firebase_screen,
+    engaged_session_event,
+    ufe.string_value               AS variant
+  FROM {table}
+  CROSS JOIN UNNEST(user_firebase_experiments) AS ufe
+  WHERE event_date BETWEEN start_date AND end_date
+    AND platform IN ('ANDROID', 'IOS')
+    AND user_pseudo_id IS NOT NULL
+    AND user_session_id IS NOT NULL
+    AND ufe.key IN ('{android_key}', '{ios_key}')
+    AND (
+          (platform = 'ANDROID' AND ufe.key = '{android_key}')
+       OR (platform = 'IOS'     AND ufe.key = '{ios_key}')
+    )
+),
+
+experiment_population AS (
+  SELECT DISTINCT
+    user_pseudo_id,
+    variant
+  FROM prep
+),
+
+{metric_ctes_sql}
+
+SELECT
+  ep.user_pseudo_id,
+  ep.variant,
+{select_metric_cols}
+FROM experiment_population ep
+{join_lines}
+ORDER BY ep.variant, ep.user_pseudo_id;
+"""
+
+
+def run_raw_data_export() -> None:
+    print()
+    start, end = ask_dates()
+
+    print()
+    android_key = get_input("Android firebase_exp key (e.g. firebase_exp_android): ")
+    ios_key     = get_input("iOS     firebase_exp key (e.g. firebase_exp_ios): ")
+
+    metrics = collect_metrics(mode4=True)
+
+    sql = build_raw_data_sql(start, end, android_key, ios_key, metrics)
+
+    print("\n" + "="*60 + "\n  Generated SQL\n" + "="*60 + "\n")
+    print(sql)
+
+    metric_tag = "_".join(safe_name(m["name"]) for m in metrics[:3])
+    save_sql(sql, f"raw_{android_key}_{start}_{end}_{metric_tag}.sql")
+
+
 def run_ab_test_app() -> None:
     print()
     start, end = ask_dates()
@@ -730,10 +854,11 @@ def main() -> None:
     print("  [1] Basic event query   (web / app / ecom)")
     print("  [2] App Firebase A/B test")
     print("  [3] App Firebase A/B test — significance test")
+    print("  [4] App Firebase A/B test — user-level raw data export")
     print()
 
     while True:
-        mode = input("Select mode [1/2/3]: ").strip()
+        mode = input("Select mode [1/2/3/4]: ").strip()
         if mode == "1":
             run_event_query()
             break
@@ -743,7 +868,10 @@ def main() -> None:
         if mode == "3":
             run_significance_test()
             break
-        print("  [!] Enter 1, 2, or 3.")
+        if mode == "4":
+            run_raw_data_export()
+            break
+        print("  [!] Enter 1, 2, 3, or 4.")
 
 
 if __name__ == "__main__":
